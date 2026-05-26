@@ -56,7 +56,9 @@ models/                      # 模型文件目录
 
 ### 3. 安装依赖
 ```bash
-pip install -r requirements.txt
+conda create -y -p ./venv python=3.12
+conda activate ./venv
+pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
 ```
 
 ### 4. 配置环境变量
@@ -76,13 +78,110 @@ DASHSCOPE_API_KEY=your_api_key    # DashScope API密钥
 
 # MinIO配置
 OSS_BUCKET_NAME=your_bucket_name   # MinIO存储桶名称
+
+# 场景挖掘算法配置
+SCENE_MINING_CONFIG_PATH=app/algorithm/scene_mining/config-qwen-gemini.yaml
+SCENE_MINING_OUTPUT_DIR=outputs/scene_mining
+SCENE_MINING_VIDEO_CACHE_DIR=data/scene_mining_videos
+SCENE_MINING_VIDEO_URL_PREFIX=file:///app/videos
+SCENE_MINING_SUMMARY_MAX_TOKENS=4096
+
+# Qwen3-VL-Embedding vLLM 服务与检索特征配置
+EMBEDDING_MODEL=qwen3-vl
+QWEN3_VL_EMBEDDING_BASE_URL=http://localhost:8575
+QWEN3_VL_EMBEDDING_DIM=2048
+QWEN3_VL_EMBEDDING_TIMEOUT=300
+QWEN3_VL_EMBEDDING_RETRIES=2
+QWEN3_VL_EMBEDDING_RETRY_BACKOFF=1
+QWEN3_VL_GPU_MEMORY_UTILIZATION=0.1727
+QWEN3_VL_MAX_MODEL_LEN=32768
+MILVUS_VIDEO_TEXT_FEATURE_COLLECTION_NAME=video_text_features
+MILVUS_VIDEO_VISUAL_FEATURE_COLLECTION_NAME=video_visual_features
+FRAME_SAMPLE_FPS=1
+FRAME_SAMPLE_MAX_FRAMES=20
+FRAME_SAMPLE_EVENT_FPS=1
+MEDIA_CACHE_DIR=data/media_cache
+MEDIA_CACHE_MAX_AGE=3600
+TASK_STATUS_DIR=data/task_status
+ENABLE_LEGACY_VIDEO_PROXY=false
+
+# 场景挖掘 VLM 服务
+SCENE_MINING_API_BASE_URL=http://localhost:8576/v1
+SCENE_MINING_API_MODEL_NAME=/models/qwen-gemini
+SCENE_MINING_VLM_PORT=8576
+SCENE_MINING_VLM_GPU_MEMORY_UTILIZATION=0.7773
+SCENE_MINING_VLM_MAX_MODEL_LEN=40960
 ```
 
 注意：请将示例值替换为实际的配置值。
 
+场景挖掘默认通过当前项目内置的 `app/algorithm/scene_mining/config-qwen-gemini.yaml` 连接当前算法端 `http://localhost:8574/v1`，模型名为 `/models/qwen-gemini`。启动前请确保算法端已可访问；若待分析视频不是默认 `/mnt/data/ai-ground/dataset/videos` 下的文件，服务会缓存到 `SCENE_MINING_VIDEO_CACHE_DIR` 后再送入算法流程。
+
 ### 5. 启动应用
 ```bash
-python run.py
+python app.py
+```
+
+### Docker + vLLM 启动
+
+`docker-compose.yml` 会启动三个服务：
+
+- `qwen-gemini-vlm`：基于 `swr.cn-north-4.myhuaweicloud.com/ddn-k8s/docker.io/vllm/vllm-openai:v0.21.0-ubuntu2404` 挂载 `/mnt/data/checkpoints/Qwen3_5-9B-Gemini-Distill`，在 compose 内网提供 OpenAI-compatible `/v1` VLM 服务，并仅绑定宿主 `127.0.0.1:8576`。
+- `qwen3-vl-embedding`：基于同一 vLLM 镜像挂载 `/mnt/data/checkpoints/Qwen3-VL-Embedding-2B`，在 compose 内网提供 `/embed` 特征服务，并仅绑定宿主 `127.0.0.1:8575`。
+- `vision-perception`：Flask 应用，只通过 `QWEN3_VL_EMBEDDING_BASE_URL` 调用 embedding 服务，不在应用进程加载模型。
+
+```bash
+cp .env_sample .env
+./scripts/start_docker_auto_gpu.sh
+```
+
+脚本会用 `nvidia-smi` 选择空闲显存最多的 GPU，并设置 `CUDA_VISIBLE_DEVICES` 后执行 `docker compose up --build`。默认挂载视频目录 `/mnt/data/ai-ground/dataset/videos:/app/videos:ro`，运行输出写入 `./outputs`，缓存写入 `./data`。
+
+同卡共部署时，默认按总显存利用率 0.95 且 **VLM:Embedding = 9:2** 分配 vLLM `gpu-memory-utilization`：`SCENE_MINING_VLM_GPU_MEMORY_UTILIZATION=0.7773`，`QWEN3_VL_GPU_MEMORY_UTILIZATION=0.1727`。
+
+由于当前云主机的 EIP 入口对 Docker bridge 端口转发不稳定，`vision-perception` 使用 host network 直接监听 `SERVER_PORT`；VLM 和 embedding 只绑定宿主 loopback，不暴露公网：
+
+```ini
+SCENE_MINING_API_BASE_URL=http://127.0.0.1:8576/v1
+QWEN3_VL_EMBEDDING_BASE_URL=http://127.0.0.1:8575
+```
+
+Qwen3-VL-Embedding 检索会写入两个新增 Milvus collection：`video_text_features` 保存 `tags` 与 `summary` 两条文本特征，`video_visual_features` 保存每个视频一条由 ffmpeg 采样帧池化得到的全局视觉特征。
+
+视频和缩略图对浏览器统一返回 `/media/<bucket>/<object>`。服务会先从 MinIO 拉取到 `MEDIA_CACHE_DIR`，再用 Flask `send_file(conditional=True)` 支持 Range 播放，避免公网代理长连接直连 MinIO 时偶发 502。媒体健康检查：
+
+```bash
+curl 'http://127.0.0.1:30501/api/media/health?url=/media/perception-mining/example.mp4'
+curl -X POST http://127.0.0.1:30501/api/media/health \
+  -H 'Content-Type: application/json' \
+  -d '{"urls":["/media/perception-mining/example.mp4"],"warm_cache":true}'
+```
+
+长任务处理除 `/api/add/stream` 外，也支持任务化轮询，进度状态写入 `TASK_STATUS_DIR`，浏览器刷新或代理断开后可继续查询：
+
+```bash
+curl -X POST http://127.0.0.1:30501/api/add/task \
+  -H 'Content-Type: application/json' \
+  -d '{"video_url":"/media/perception-mining/example.mp4","action_type":3}'
+curl http://127.0.0.1:30501/api/add/task/<task_id>
+```
+
+运行期临时文件清理：
+
+```bash
+python -m app.scripts.cleanup_runtime --dry-run
+python -m app.scripts.cleanup_runtime --max-age-hours 24
+```
+
+默认清理媒体本地缓存、任务状态、分片上传残留、上传锁和 scene mining 裁切 clip；`SCENE_MINING_VIDEO_CACHE_DIR` 默认保留，确认不需要复用时可加 `--include-video-cache`。
+
+初始化/补齐 feature collection：
+
+```bash
+python -m app.scripts.create_database
+python -m app.scripts.backfill_features --limit 10        # 试跑
+python -m app.scripts.backfill_features                   # 全量回填
+python -m app.scripts.backfill_features --skip-visual     # 仅回填文本特征
 ```
 
 ## API 参考
